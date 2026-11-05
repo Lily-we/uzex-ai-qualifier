@@ -17,7 +17,10 @@ import urllib.error
 import zipfile
 from typing import Any
 
-import gradio as gr
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import uvicorn
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / 'uzex_spot_data'
@@ -275,17 +278,16 @@ def read_query(sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
 
 def query_plan(question: str) -> dict[str, Any]:
     """Call Gemini via the public REST API. Only SQL proposals, never factual answers."""
-    model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+    model = os.getenv('GEMINI_MODEL', 'gemini-3.5-flash-lite')
     if not re.fullmatch(r'[a-zA-Z0-9._-]+', model):
         raise ValueError('Invalid Gemini model name')
     payload = {
         'systemInstruction': {'parts': [{'text': SYSTEM}]},
         'contents': [{'role': 'user', 'parts': [{'text': question}]}],
         'generationConfig': {
-            'temperature': 0,
             'maxOutputTokens': 2500,
             'responseMimeType': 'application/json',
-            'thinkingConfig': {'thinkingBudget': 0},
+            'thinkingConfig': {'thinkingLevel': 'minimal'},
         },
     }
     request = urllib.request.Request(
@@ -297,8 +299,17 @@ def query_plan(question: str) -> dict[str, Any]:
         },
         method='POST',
     )
-    with urllib.request.urlopen(request, timeout=35) as response:
-        content = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            content = json.load(response)
+    except urllib.error.HTTPError as error:
+        # Keep credentials and request data out of server logs.
+        try:
+            err_body = json.loads(error.read(4096).decode('utf-8', 'replace'))
+            provider_status = str(err_body.get('error', {}).get('status', 'UNKNOWN'))[:40]
+        except Exception:
+            provider_status = 'UNKNOWN'
+        raise RuntimeError(f'Gemini API HTTP {error.code} ({provider_status})') from None
     candidates = content.get('candidates') or []
     if not candidates:
         raise ValueError('Gemini returned no SQL proposal')
@@ -328,7 +339,8 @@ def create_response(question: str, history: list | None = None) -> str:
     if len(question) > 2000:
         return 'Question too long. / Savol juda uzun.'
     if not os.getenv('GEMINI_API_KEY'):
-        return '⚠️ **Deployment setup required:** the host must set the `GEMINI_API_KEY` secret. No key is stored in the application source.'
+        return ('**Sozlash talab etiladi.** Serverda Gemini API kaliti o‘rnatilmagan. / '
+                '**Требуется настройка.** На сервере отсутствует ключ Gemini API.')
     try:
         build_database()
         plan = query_plan(question)
@@ -380,35 +392,41 @@ def create_response(question: str, history: list | None = None) -> str:
                 '**Не удалось получить проверенный ответ.** Безопасно выполнить запрос не получилось.')
     except Exception as ex:
         print(f'Query failure: {type(ex).__name__}: {ex}',flush=True)
-        return ('**A verified answer is unavailable.** The application did not return an unverified result. '
-                '/ **Tasdiqlangan javob mavjud emas.**')
+        return ('**Tasdiqlangan javob mavjud emas.** Maʼlumotlar asosida tekshirilgan natija olinmadi.'
+                if re.search(r'[oʻgʻ]|yil|bitim|qaysi|nechta', question.lower()) else
+                '**Не удалось получить проверенный ответ.** Система не выдала неподтверждённых данных.')
+
+
+class AskRequest(BaseModel):
+    question: str
+
+
+api = FastAPI(title='UZEX AI', docs_url=None, redoc_url=None)
+
+
+@api.get('/', response_class=HTMLResponse)
+def home() -> str:
+    return (ROOT / 'frontend.html').read_text(encoding='utf-8')
+
+
+@api.get('/health')
+def health() -> dict[str, Any]:
+    return {
+        'ready': DB.is_file() and DB.stat().st_size > 1024 * 1024,
+        'gemini_key_present': bool(os.getenv('GEMINI_API_KEY')),
+        'gemini_model': os.getenv('GEMINI_MODEL', 'gemini-3.5-flash-lite'),
+    }
+
+
+@api.post('/api/ask')
+def ask(req: AskRequest) -> dict[str, str]:
+    return {'answer': create_response(req.question)}
 
 
 def main() -> None:
     build_database()
-    with gr.Blocks(title='UZEX AI · Exchange Registry') as demo:
-        gr.Markdown('''# UZEX AI · Exchange Registry\n
-**AI agent for 500,000 exchange deals · Биржевой AI-ассистент · Birja AI yordamchisi**
+    uvicorn.run(api, host='0.0.0.0', port=int(os.getenv('PORT','7860')), log_level='info')
 
-Ask in **Uzbek** or **Russian**. Responses are computed from the provided synthetic database and include the executed SQL. If an answer cannot be verified, the agent explicitly says so.
-''')
-        gr.ChatInterface(
-            fn=create_response,
-            examples=[
-                'Сколько сделок заключено в 2025 году?',
-                '2026-yil oktabr oyida nechta bitim tuzilgan?',
-                'Какие пять категорий товаров лидируют по сумме сделок в 2024 году в сумах?',
-                '2025-yilda qaysi hududda eng ko‘p bitim tuzilgan?',
-                'Какой объём сделок ожидается в 2027 году?'
-            ],
-            cache_examples=False,
-        )
-        gr.Markdown('**Data source:** UZEX qualification dataset, fictional records, 2022-01-03 through 2026-10-30. Deal states are as of 2026-10-30. No login required.')
-    demo.queue(max_size=48,default_concurrency_limit=3).launch(
-        server_name='0.0.0.0',
-        server_port=int(os.environ.get('PORT','7860')),
-        share=False,
-    )
 
 if __name__ == '__main__':
     main()
