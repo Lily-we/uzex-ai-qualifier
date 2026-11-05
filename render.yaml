@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: uzex-ai-qualifier
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && python -c "import app; app.build_database()"
+    startCommand: python app.py
+    healthCheckPath: /
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: PYTHON_VERSION
+        value: 3.11.11

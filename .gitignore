@@ -1,0 +1,6 @@
+*.sqlite3
+*.building
+__pycache__/
+.env
+*.pyc
+uzex_spot_data/
